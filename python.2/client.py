@@ -3,17 +3,21 @@ import socket
 HOST = '127.0.0.1'
 PORT = 65433
 
-client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-print(f"[CONNECTING] Trying to connect to server at {HOST}:{PORT}...")
-client_socket.connect((HOST, PORT))
-print("[CONNECTED] Successfully connected!")
+server_socket.bind((HOST, PORT))
+server_socket.listen()
+print(f"[STARTING] Server is listening on {HOST}:{PORT}...")
 
-text_to_send = "Hello Server, I've arrived!"
-client_socket.send(text_to_send.encode('utf-8'))
+client_socket, client_address = server_socket.accept()
+print(f"[NEW CONNECTION] Connected to client at {client_address}")
 
-server_reply = client_socket.recv(1024).decode('utf-8')
-print(f"[SERVER REPLY] {server_reply}")
+message = client_socket.recv(1024).decode('utf-8')
+print(f"[RECEIVED] Client says: {message}")
+
+reply = "Message received loud and clear!"
+client_socket.send(reply.encode('utf-8'))
 
 client_socket.close()
-print("[DISCONNECTED] Connection closed.")
+server_socket.close()
+print("[SHUTDOWN] Server closed.")

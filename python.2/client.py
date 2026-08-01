@@ -1,23 +1,43 @@
 import socket
+import threading
 
 HOST = '127.0.0.1'
 PORT = 65433
 
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def receive_messages(client_socket):
+    while True:
+        try:
+            message = client_socket.recv(1024).decode('utf-8')
+            if not message:
+                print("\n[DISCONNECTED] Server closed the connection.")
+                break
+            print(f"\n{message}")
+        except:
+            print("\n[ERROR] Lost connection to the server.")
+            break
 
-server_socket.bind((HOST, PORT))
-server_socket.listen()
-print(f"[STARTING] Server is listening on {HOST}:{PORT}...")
+client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-client_socket, client_address = server_socket.accept()
-print(f"[NEW CONNECTION] Connected to client at {client_address}")
+try:
+    print(f"[CONNECTING] Connecting to server at {HOST}:{PORT}...")
+    client_socket.connect((HOST, PORT))
+    print("[CONNECTED] Successfully connected to the server!")
+    
+    receive_thread = threading.Thread(target=receive_messages, args=(client_socket,))
+    receive_thread.daemon = True
+    receive_thread.start()
 
-message = client_socket.recv(1024).decode('utf-8')
-print(f"[RECEIVED] Client says: {message}")
+    print("Type your messages below (type 'exit' to quit):\n")
+    while True:
+        msg = input()
+        if msg.lower() == 'exit':
+            break
+        if msg:
+            client_socket.send(msg.encode('utf-8'))
 
-reply = "Message received loud and clear!"
-client_socket.send(reply.encode('utf-8'))
+except Exception as e:
+    print(f"[ERROR] Could not connect: {e}")
 
-client_socket.close()
-server_socket.close()
-print("[SHUTDOWN] Server closed.")
+finally:
+    client_socket.close()
+    print("[DISCONNECTED] Client closed.")

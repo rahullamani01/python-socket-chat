@@ -1,11 +1,36 @@
 import socket
 import threading
+import json
+import os
+from datetime import datetime
 
 HOST = '127.0.0.1'
 PORT = 65433
 
-
+LOG_FILE = "chat_history.json"
 clients = {}
+
+def log_message(sender, recipient, content, msg_type="broadcast"):
+    log_entry = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "sender": sender,
+        "recipient": recipient,
+        "type": msg_type,
+        "content": content
+    }
+    
+    history = []
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, "r") as f:
+                history = json.load(f)
+        except:
+            history = []
+            
+    history.append(log_entry)
+    
+    with open(LOG_FILE, "w") as f:
+        json.dump(history, f, indent=4)
 
 def broadcast(message, sender_socket=None):
     for client in list(clients.keys()):
@@ -24,7 +49,6 @@ def remove_client(client_socket):
 
 def handle_client(client_socket, client_address):
     try:
-        # Prompt for username on initial connection
         client_socket.send("NICK".encode('utf-8'))
         username = client_socket.recv(1024).decode('utf-8').strip()
         
@@ -36,14 +60,13 @@ def handle_client(client_socket, client_address):
         print(f"[REGISTERED] {client_address} registered as '{username}'")
         
         broadcast(f"*** {username} joined the chat! ***")
-        client_socket.send(f"Welcome to the server, {username}! Type /msg <user> <message> for private chats.".encode('utf-8'))
+        client_socket.send(f"Welcome, {username}! Use /msg <user> <message> for PMs.".encode('utf-8'))
 
         while True:
             message = client_socket.recv(1024).decode('utf-8')
             if not message:
                 break
                 
-            
             if message.startswith("/msg "):
                 parts = message.split(" ", 2)
                 if len(parts) >= 3:
@@ -59,14 +82,15 @@ def handle_client(client_socket, client_address):
                     if target_socket:
                         target_socket.send(f"[PM from {username}]: {private_msg}".encode('utf-8'))
                         client_socket.send(f"[PM to {target_user}]: {private_msg}".encode('utf-8'))
+                        log_message(username, target_user, private_msg, msg_type="private")
                     else:
                         client_socket.send(f"*** User '{target_user}' not found. ***".encode('utf-8'))
                 else:
                     client_socket.send("*** Usage: /msg <username> <message> ***".encode('utf-8'))
             else:
-                # Regular Broadcast Message
                 formatted_msg = f"{username}: {message}"
                 broadcast(formatted_msg, client_socket)
+                log_message(username, "ALL", message, msg_type="broadcast")
 
     except:
         pass

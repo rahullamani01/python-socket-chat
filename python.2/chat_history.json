@@ -1,0 +1,23 @@
+[
+    {
+        "timestamp": "2026-08-16 11:16:57",
+        "sender": "Alex",
+        "recipient": "ALL",
+        "type": "broadcast",
+        "content": "Hey Rahul, testing the new UI"
+    },
+    {
+        "timestamp": "2026-08-17 15:34:16",
+        "sender": "Alex",
+        "recipient": "ALL",
+        "type": "broadcast",
+        "content": "Hey Rahul, testing the new UI"
+    },
+    {
+        "timestamp": "2026-08-17 15:34:58",
+        "sender": "Rahul",
+        "recipient": "ALL",
+        "type": "broadcast",
+        "content": "search alex"
+    }
+]

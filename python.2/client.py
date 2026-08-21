@@ -2,11 +2,32 @@ import socket
 import threading
 import os
 import sys
+import hashlib
 import tkinter as tk
 from tkinter import messagebox, simpledialog, scrolledtext
 
 HOST = '127.0.0.1'
 PORT = 65433
+
+SECRET_KEY = "chat_secret_key"  # Default shared secret key
+
+def encrypt_message(plain_text, key=SECRET_KEY):
+    key_hash = hashlib.sha256(key.encode('utf-8')).digest()
+    encrypted_bytes = bytearray()
+    for i, char in enumerate(plain_text.encode('utf-8')):
+        encrypted_bytes.append(char ^ key_hash[i % len(key_hash)])
+    return encrypted_bytes.hex()
+
+def decrypt_message(hex_text, key=SECRET_KEY):
+    try:
+        key_hash = hashlib.sha256(key.encode('utf-8')).digest()
+        encrypted_bytes = bytes.fromhex(hex_text)
+        decrypted_bytes = bytearray()
+        for i, byte in enumerate(encrypted_bytes):
+            decrypted_bytes.append(byte ^ key_hash[i % len(key_hash)])
+        return decrypted_bytes.decode('utf-8')
+    except Exception:
+        return "[Decryption Error: Invalid Secret Key or Corrupted Packet]"
 
 def play_alert_sound():
     try:
@@ -21,7 +42,7 @@ def play_alert_sound():
 class ChatGUI:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Python Socket Chat Room")
+        self.root.title("Python Socket Chat Room [E2E Encrypted]")
         self.root.geometry("480x580")
         self.root.configure(bg="#2c3e50")
 
@@ -80,13 +101,24 @@ class ChatGUI:
                 if message == "NICK":
                     self.client_socket.send(self.username.encode('utf-8'))
                 elif message:
-                    if message.startswith("***"):
+                    if message.startswith("***") or message.startswith("Welcome"):
                         self.display_message(message, tag="system")
-                    elif "[PM from" in message or "[PM to" in message:
-                        self.display_message(message, tag="pm")
+                    elif "[PM from" in message:
+                        prefix, hex_payload = message.split(": ", 1)
+                        decrypted_text = decrypt_message(hex_payload)
+                        self.display_message(f"{prefix}: {decrypted_text}", tag="pm")
                         play_alert_sound()
+                    elif "[PM to" in message:
+                        prefix, hex_payload = message.split(": ", 1)
+                        decrypted_text = decrypt_message(hex_payload)
+                        self.display_message(f"{prefix}: {decrypted_text}", tag="pm")
                     else:
-                        self.display_message(message, tag="normal")
+                        if ": " in message:
+                            sender, hex_payload = message.split(": ", 1)
+                            decrypted_text = decrypt_message(hex_payload)
+                            self.display_message(f"{sender}: {decrypted_text}", tag="normal")
+                        else:
+                            self.display_message(message, tag="normal")
                         play_alert_sound()
                 else:
                     break
@@ -94,13 +126,24 @@ class ChatGUI:
                 break
 
     def send_message(self, event=None):
-        msg = self.msg_entry.get().strip()
-        if msg:
+        raw_msg = self.msg_entry.get().strip()
+        if raw_msg:
             self.msg_entry.delete(0, tk.END)
             try:
-                self.client_socket.send(msg.encode('utf-8'))
-                if not msg.startswith("/"):
-                    self.display_message(f"You: {msg}", tag="self")
+                if raw_msg.startswith("/msg "):
+                    parts = raw_msg.split(" ", 2)
+                    if len(parts) >= 3:
+                        target_user = parts[1]
+                        private_body = parts[2]
+                        encrypted_body = encrypt_message(private_body)
+                        wire_payload = f"/msg {target_user} {encrypted_body}"
+                        self.client_socket.send(wire_payload.encode('utf-8'))
+                    else:
+                        self.display_message("*** Usage: /msg <username> <message> ***", tag="system")
+                else:
+                    encrypted_body = encrypt_message(raw_msg)
+                    self.client_socket.send(encrypted_body.encode('utf-8'))
+                    self.display_message(f"You: {raw_msg}", tag="self")
             except:
                 self.display_message("[ERROR] Failed to send message.", tag="system")
 

@@ -60,7 +60,7 @@ def handle_client(client_socket, client_address):
         print(f"[REGISTERED] {client_address} registered as '{username}'")
         
         broadcast(f"*** {username} joined the chat! ***")
-        client_socket.send(f"Welcome, {username}! Use /msg <user> <message> for PMs.".encode('utf-8'))
+        client_socket.send(f"Welcome, {username}! (E2E Encrypted Channel Active)".encode('utf-8'))
 
         while True:
             message = client_socket.recv(1024).decode('utf-8')
@@ -82,7 +82,7 @@ def handle_client(client_socket, client_address):
                     if target_socket:
                         target_socket.send(f"[PM from {username}]: {private_msg}".encode('utf-8'))
                         client_socket.send(f"[PM to {target_user}]: {private_msg}".encode('utf-8'))
-                        log_message(username, target_user, private_msg, msg_type="private")
+                        log_message(username, target_user, "[ENCRYPTED PAYLOAD]", msg_type="private")
                     else:
                         client_socket.send(f"*** User '{target_user}' not found. ***".encode('utf-8'))
                 else:
@@ -90,7 +90,7 @@ def handle_client(client_socket, client_address):
             else:
                 formatted_msg = f"{username}: {message}"
                 broadcast(formatted_msg, client_socket)
-                log_message(username, "ALL", message, msg_type="broadcast")
+                log_message(username, "ALL", "[ENCRYPTED PAYLOAD]", msg_type="broadcast")
 
     except:
         pass

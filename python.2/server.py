@@ -4,107 +4,185 @@ import json
 import os
 from datetime import datetime
 
-HOST = '127.0.0.1'
+HOST = "127.0.0.1"
 PORT = 65433
+LOG_FILE = "chat_history.jsonl"
+HEADER_SIZE = 4
 
-LOG_FILE = "chat_history.json"
-clients = {}
+clients = {}  
+clients_lock = threading.Lock()
+
+
+def send_framed(sock, data: dict):
+    """Sends a 4-byte length-prefixed JSON packet."""
+    try:
+        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        header = len(payload).to_bytes(HEADER_SIZE, "big")
+        sock.sendall(header + payload)
+        return True
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        return False
+
+
+def recv_framed(sock):
+    """Receives a 4-byte length-prefixed JSON packet (up to 10MB for file support)."""
+    try:
+        header = sock.recv(HEADER_SIZE)
+        if len(header) < HEADER_SIZE:
+            return None
+        length = int.from_bytes(header, "big")
+        if length <= 0 or length > 10_000_000: 
+            return None
+        data = b""
+        while len(data) < length:
+            chunk = sock.recv(min(4096, length - len(data)))
+            if not chunk:
+                return None
+            data += chunk
+        return json.loads(data.decode("utf-8"))
+    except (ConnectionResetError, json.JSONDecodeError, OSError, ValueError):
+        return None
+
 
 def log_message(sender, recipient, content, msg_type="broadcast"):
-    log_entry = {
+    entry = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "sender": sender,
         "recipient": recipient,
         "type": msg_type,
-        "content": content
+        "content": content,
     }
-    
-    history = []
-    if os.path.exists(LOG_FILE):
-        try:
-            with open(LOG_FILE, "r") as f:
-                history = json.load(f)
-        except:
-            history = []
-            
-    history.append(log_entry)
-    
-    with open(LOG_FILE, "w") as f:
-        json.dump(history, f, indent=4)
-
-def broadcast(message, sender_socket=None):
-    for client in list(clients.keys()):
-        if client != sender_socket:
-            try:
-                client.send(message.encode('utf-8'))
-            except:
-                remove_client(client)
-
-def remove_client(client_socket):
-    if client_socket in clients:
-        username = clients[client_socket]
-        del clients[client_socket]
-        client_socket.close()
-        broadcast(f"*** {username} has left the chat. ***")
-
-def handle_client(client_socket, client_address):
     try:
-        client_socket.send("NICK".encode('utf-8'))
-        username = client_socket.recv(1024).decode('utf-8').strip()
-        
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"[LOG ERROR] {e}")
+
+
+def broadcast(msg: dict, exclude=None):
+    dead = []
+    with clients_lock:
+        targets = list(clients.keys())
+    for sock in targets:
+        if sock is exclude:
+            continue
+        if not send_framed(sock, msg):
+            dead.append(sock)
+    for sock in dead:
+        remove_client(sock)
+
+
+def broadcast_user_list():
+    with clients_lock:
+        users = sorted(clients.values())
+    broadcast({"type": "users", "users": users})
+
+
+def remove_client(sock):
+    with clients_lock:
+        username = clients.pop(sock, None)
+    if username:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        broadcast({"type": "system", "text": f"*** {username} has left the chat. ***"})
+        broadcast_user_list()
+        print(f"[DISCONNECT] {username}")
+
+
+def handle_client(sock, addr):
+    username = None
+    try:
+      
+        send_framed(sock, {"type": "nick_request"})
+        data = recv_framed(sock)
+        if not data or data.get("type") != "nick" or not data.get("username"):
+            return
+        username = data["username"].strip()[:32]
         if not username:
-            client_socket.close()
             return
 
-        clients[client_socket] = username
-        print(f"[REGISTERED] {client_address} registered as '{username}'")
-        
-        broadcast(f"*** {username} joined the chat! ***")
-        client_socket.send(f"Welcome, {username}! (E2E Encrypted Channel Active)".encode('utf-8'))
+        with clients_lock:
+            if username in clients.values():
+                send_framed(sock, {"type": "error", "text": "Username already taken."})
+                return
+            clients[sock] = username
 
+        print(f"[REGISTERED] {addr} → '{username}'")
+        broadcast({"type": "system", "text": f"*** {username} joined the chat! ***"}, exclude=sock)
+        send_framed(sock, {"type": "welcome", "text": f"Welcome to the server, {username}!"})
+        broadcast_user_list()
+
+       
         while True:
-            message = client_socket.recv(1024).decode('utf-8')
-            if not message:
+            data = recv_framed(sock)
+            if data is None:
                 break
-                
-            if message.startswith("/msg "):
-                parts = message.split(" ", 2)
-                if len(parts) >= 3:
-                    target_user = parts[1]
-                    private_msg = parts[2]
-                    
-                    target_socket = None
-                    for sock, name in clients.items():
-                        if name == target_user:
-                            target_socket = sock
+
+            msg_type = data.get("type")
+
+            if msg_type == "chat":
+                text = data.get("text", "").strip()
+                if text:
+                    broadcast({"type": "chat", "sender": username, "text": text}, exclude=sock)
+                    log_message(username, "ALL", text, "broadcast")
+
+            elif msg_type == "pm":
+                target = data.get("target", "").strip()
+                text = data.get("text", "").strip()
+                if not target or not text:
+                    send_framed(sock, {"type": "error", "text": "Usage: /msg <user> <message>"})
+                    continue
+                target_sock = None
+                with clients_lock:
+                    for s, name in clients.items():
+                        if name == target:
+                            target_sock = s
                             break
-                    
-                    if target_socket:
-                        target_socket.send(f"[PM from {username}]: {private_msg}".encode('utf-8'))
-                        client_socket.send(f"[PM to {target_user}]: {private_msg}".encode('utf-8'))
-                        log_message(username, target_user, "[ENCRYPTED PAYLOAD]", msg_type="private")
-                    else:
-                        client_socket.send(f"*** User '{target_user}' not found. ***".encode('utf-8'))
+                if target_sock:
+                    send_framed(target_sock, {"type": "pm", "from": username, "text": text})
+                    send_framed(sock, {"type": "pm_self", "to": target, "text": text})
+                    log_message(username, target, text, "private")
                 else:
-                    client_socket.send("*** Usage: /msg <username> <message> ***".encode('utf-8'))
-            else:
-                formatted_msg = f"{username}: {message}"
-                broadcast(formatted_msg, client_socket)
-                log_message(username, "ALL", "[ENCRYPTED PAYLOAD]", msg_type="broadcast")
+                    send_framed(sock, {"type": "error", "text": f"User '{target}' not found."})
 
-    except:
-        pass
+            elif msg_type == "file":
+                filename = data.get("filename")
+                file_data = data.get("file_data")
+                if filename and file_data:
+                    broadcast(
+                        {"type": "file", "sender": username, "filename": filename, "file_data": file_data},
+                        exclude=sock
+                    )
+                    log_message(username, "ALL", f"[FILE: {filename}]", "file")
+
+            elif msg_type == "quit":
+                break
+
+    except Exception as e:
+        print(f"[ERROR] {username or addr}: {e}")
     finally:
-        remove_client(client_socket)
+        remove_client(sock)
 
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server_socket.bind((HOST, PORT))
-server_socket.listen()
 
-print(f"[SERVER RUNNING] Listening on {HOST}:{PORT}...")
+def main():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen()
+    print(f"[SERVER RUNNING] Listening on {HOST}:{PORT}...")
 
-while True:
-    client_socket, client_address = server_socket.accept()
-    thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
-    thread.start()
+    try:
+        while True:
+            client_sock, addr = server.accept()
+            t = threading.Thread(target=handle_client, args=(client_sock, addr), daemon=True)
+            t.start()
+    except KeyboardInterrupt:
+        print("\n[SERVER] Shutting down...")
+    finally:
+        server.close()
+
+
+if __name__ == "__main__":
+    main()

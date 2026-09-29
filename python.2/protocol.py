@@ -1,4 +1,4 @@
-# chat/protocol.py
+# protocol.py
 import json
 import socket
 from typing import Optional, Dict, Any
@@ -6,7 +6,7 @@ from config import HEADER_SIZE, MAX_MESSAGE_SIZE
 
 
 def send_framed(sock: socket.socket, data: Dict[str, Any]) -> bool:
-    """Send a length-prefixed JSON message."""
+    """Send a length-prefixed JSON payload across TCP stream."""
     try:
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
         if len(payload) > MAX_MESSAGE_SIZE:
@@ -19,7 +19,7 @@ def send_framed(sock: socket.socket, data: Dict[str, Any]) -> bool:
 
 
 def recv_framed(sock: socket.socket) -> Optional[Dict[str, Any]]:
-    """Receive a length-prefixed JSON message."""
+    """Receive a length-prefixed JSON payload from TCP stream."""
     try:
         header = b""
         while len(header) < HEADER_SIZE:

@@ -1,10 +1,10 @@
-# chat/utils.py
+# utils.py
 import os
-import base64
 import json
 import logging
+import hashlib
 from datetime import datetime
-from config import LOG_FILE, MAX_FILE_SIZE
+from config import LOG_FILE, CHUNK_SIZE
 
 
 def setup_logging():
@@ -35,15 +35,17 @@ def log_message(sender: str, recipient: str, content: str, msg_type: str = "broa
         logging.error(f"Failed to write log: {e}")
 
 
-def file_to_base64(file_path: str) -> str:
-    size = os.path.getsize(file_path)
-    if size > MAX_FILE_SIZE:
-        raise ValueError(f"File too large (max {MAX_FILE_SIZE // 1024 // 1024} MB)")
+def calculate_sha256(file_path: str) -> str:
+    """Computes SHA-256 hash incrementally in chunks."""
+    sha256 = hashlib.sha256()
     with open(file_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+        while chunk := f.read(CHUNK_SIZE):
+            sha256.update(chunk)
+    return sha256.hexdigest()
 
 
-def base64_to_file(base64_str: str, output_path: str):
-    file_bytes = base64.b64decode(base64_str.encode("utf-8"))
-    with open(output_path, "wb") as f:
-        f.write(file_bytes)
+def verify_file_integrity(file_path: str, expected_hash: str) -> bool:
+    """Verifies file hash against expected checksum."""
+    if not os.path.exists(file_path):
+        return False
+    return calculate_sha256(file_path) == expected_hash

@@ -1,7 +1,6 @@
-
+# models.py
 from dataclasses import dataclass, asdict
 from typing import Optional, List
-from datetime import datetime
 
 
 @dataclass
@@ -57,11 +56,34 @@ class PrivateMessageSelf(BaseMessage):
 
 
 @dataclass
-class FileMessage(BaseMessage):
+class FileOffer(BaseMessage):
+    file_id: str
     sender: str
     filename: str
-    file_data: str
-    type: str = "file"
+    file_size: int
+    sha256: str
+    type: str = "file_offer"
+
+
+@dataclass
+class FileResponse(BaseMessage):
+    file_id: str
+    accepted: bool
+    type: str = "file_response"
+
+
+@dataclass
+class FileChunk(BaseMessage):
+    file_id: str
+    chunk_index: int
+    data_b64: str
+    type: str = "file_chunk"
+
+
+@dataclass
+class FileComplete(BaseMessage):
+    file_id: str
+    type: str = "file_complete"
 
 
 @dataclass

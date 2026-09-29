@@ -1,58 +1,17 @@
+# client.py
 import socket
 import threading
-import json
-import sys
 import os
+import sys
 import base64
 import tkinter as tk
 from tkinter import messagebox, simpledialog, scrolledtext, filedialog
 
-# ==================== CONFIG ====================
-HOST = "127.0.0.1"
-PORT = 65433
-HEADER_SIZE = 4
-MAX_MESSAGE_SIZE = 10 * 1024 * 1024   # 10 MB
-MAX_FILE_SIZE = 5 * 1024 * 1024       # 5 MB
-
-# ==================== PROTOCOL ====================
-def send_framed(sock, data: dict) -> bool:
-    try:
-        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        if len(payload) > MAX_MESSAGE_SIZE:
-            return False
-        header = len(payload).to_bytes(HEADER_SIZE, "big")
-        sock.sendall(header + payload)
-        return True
-    except (BrokenPipeError, ConnectionResetError, OSError):
-        return False
+from config import HOST, PORT, CHUNK_SIZE
+from protocol import send_framed, recv_framed
+from utils import calculate_sha256, verify_file_integrity
 
 
-def recv_framed(sock):
-    try:
-        header = b""
-        while len(header) < HEADER_SIZE:
-            chunk = sock.recv(HEADER_SIZE - len(header))
-            if not chunk:
-                return None
-            header += chunk
-
-        length = int.from_bytes(header, "big")
-        if length <= 0 or length > MAX_MESSAGE_SIZE:
-            return None
-
-        data = b""
-        while len(data) < length:
-            chunk = sock.recv(min(4096, length - len(data)))
-            if not chunk:
-                return None
-            data += chunk
-
-        return json.loads(data.decode("utf-8"))
-    except (ConnectionResetError, json.JSONDecodeError, OSError, ValueError):
-        return None
-
-
-# ==================== HELPERS ====================
 def play_alert():
     try:
         if sys.platform == "darwin":
@@ -64,21 +23,6 @@ def play_alert():
         pass
 
 
-def file_to_base64(file_path: str) -> str:
-    size = os.path.getsize(file_path)
-    if size > MAX_FILE_SIZE:
-        raise ValueError(f"File too large (max {MAX_FILE_SIZE // 1024 // 1024} MB)")
-    with open(file_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-
-def base64_to_file(base64_str: str, output_path: str):
-    file_bytes = base64.b64decode(base64_str.encode("utf-8"))
-    with open(output_path, "wb") as f:
-        f.write(file_bytes)
-
-
-# ==================== GUI ====================
 class ChatGUI:
     def __init__(self):
         self.root = tk.Tk()
@@ -97,6 +41,7 @@ class ChatGUI:
 
         self.sock = None
         self.running = False
+        self.incoming_files = {}  # file_id → file metadata & file object
 
         self._build_ui()
         self._connect()
@@ -105,11 +50,9 @@ class ChatGUI:
         self.root.mainloop()
 
     def _build_ui(self):
-        # Main container
         main = tk.Frame(self.root, bg="#1e1e2e")
         main.pack(padx=12, pady=12, fill=tk.BOTH, expand=True)
 
-        # Chat area
         self.chat = scrolledtext.ScrolledText(
             main,
             wrap=tk.WORD,
@@ -123,7 +66,6 @@ class ChatGUI:
         )
         self.chat.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
 
-        # Sidebar
         sidebar = tk.Frame(main, bg="#181825", width=180)
         sidebar.pack(side=tk.RIGHT, fill=tk.Y)
         sidebar.pack_propagate(False)
@@ -149,7 +91,6 @@ class ChatGUI:
         )
         self.user_list.pack(padx=8, pady=(0, 8), fill=tk.BOTH, expand=True)
 
-        # Message tags
         self.chat.tag_config("system", foreground="#a6adc8", font=("Segoe UI", 10, "italic"))
         self.chat.tag_config("pm", foreground="#cba6f7", font=("Segoe UI", 11, "bold"))
         self.chat.tag_config("self", foreground="#89b4fa", font=("Segoe UI", 11, "bold"))
@@ -158,7 +99,6 @@ class ChatGUI:
         self.chat.tag_config("file", foreground="#a6e3a1")
         self.chat.tag_config("history", foreground="#7f849c", font=("Segoe UI", 10, "italic"))
 
-        # Input area
         entry_frame = tk.Frame(self.root, bg="#1e1e2e")
         entry_frame.pack(padx=12, pady=(0, 12), fill=tk.X)
 
@@ -171,7 +111,7 @@ class ChatGUI:
             relief="flat",
         )
         self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), ipady=7)
-        self.entry.bind("<Return>", self.send_message)
+        self.entry.bind("", self.send_message)
         self.entry.focus()
 
         tk.Button(
@@ -208,7 +148,6 @@ class ChatGUI:
             messagebox.showerror("Connection Error", str(e))
             self.root.destroy()
 
-    # ---------- Thread-safe UI helpers ----------
     def safe_display(self, text: str, tag: str = "normal"):
         self.root.after(0, lambda: self._display(text, tag))
 
@@ -227,7 +166,6 @@ class ChatGUI:
             label = f"● {u} (You)" if u == self.username else f"● {u}"
             self.user_list.insert(tk.END, label)
 
-    # ---------- Networking ----------
     def receive_loop(self):
         while self.running:
             try:
@@ -252,7 +190,6 @@ class ChatGUI:
             self.safe_display(data.get("text", ""), "system")
 
         elif t == "history":
-            # Show previous messages when joining
             for msg in data.get("messages", []):
                 self._render_history_item(msg)
 
@@ -270,20 +207,57 @@ class ChatGUI:
         elif t == "pm_self":
             self.safe_display(f"[PM to {data['to']}]: {data['text']}", "pm")
 
-        elif t == "file":
-            sender = data.get("sender", "Unknown")
-            filename = data.get("filename", "file")
-            save_dir = "downloads"
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, f"received_{filename}")
-            try:
-                base64_to_file(data["file_data"], save_path)
-                self.safe_display(
-                    f"📁 [{sender}] sent file: {filename} → downloads/", "file"
-                )
-                play_alert()
-            except Exception as e:
-                self.safe_display(f"[ERROR] Failed to save file: {e}", "error")
+        # Chunked File Handlers
+        elif t == "file_offer":
+            file_id = data["file_id"]
+            sender = data["sender"]
+            filename = data["filename"]
+            size_mb = round(data["file_size"] / (1024 * 1024), 2)
+            expected_hash = data["sha256"]
+
+            accept = messagebox.askyesno(
+                "Incoming File Offer",
+                f"User '{sender}' wants to send you:\n\n{filename} ({size_mb} MB)\n\nAccept download?"
+            )
+
+            send_framed(self.sock, {"type": "file_response", "file_id": file_id, "accepted": accept})
+
+            if accept:
+                os.makedirs("downloads", exist_ok=True)
+                save_path = os.path.join("downloads", f"received_{filename}")
+                self.incoming_files[file_id] = {
+                    "filename": filename,
+                    "hash": expected_hash,
+                    "path": save_path,
+                    "file_obj": open(save_path, "wb")
+                }
+                self.safe_display(f"📥 Starting download for {filename}...", "file")
+
+        elif t == "file_response":
+            file_id = data.get("file_id")
+            if data.get("accepted"):
+                self.safe_display(f"✅ User accepted file transfer. Streaming chunks...", "file")
+                threading.Thread(target=self._stream_file_chunks, args=(file_id,), daemon=True).start()
+            else:
+                self.safe_display(f"❌ User declined file transfer.", "error")
+
+        elif t == "file_chunk":
+            file_id = data["file_id"]
+            if file_id in self.incoming_files:
+                chunk_bytes = base64.b64decode(data["data_b64"])
+                self.incoming_files[file_id]["file_obj"].write(chunk_bytes)
+
+        elif t == "file_complete":
+            file_id = data["file_id"]
+            if file_id in self.incoming_files:
+                info = self.incoming_files.pop(file_id)
+                info["file_obj"].close()
+
+                if verify_file_integrity(info["path"], info["hash"]):
+                    self.safe_display(f"✅ Download complete & SHA-256 verified: downloads/{info['filename']}", "file")
+                    play_alert()
+                else:
+                    self.safe_display(f"❌ File corruption detected for {info['filename']}", "error")
 
         elif t == "error":
             self.safe_display(f"*** {data.get('text', 'Unknown error')} ***", "error")
@@ -295,22 +269,49 @@ class ChatGUI:
         elif t == "system":
             self.safe_display(msg.get("text", ""), "history")
 
-    # ---------- Sending ----------
     def send_file_dialog(self):
         filepath = filedialog.askopenfilename(title="Select File to Send")
         if not filepath:
             return
 
         filename = os.path.basename(filepath)
-        try:
-            b64_data = file_to_base64(filepath)
-            send_framed(
-                self.sock,
-                {"type": "file", "filename": filename, "file_data": b64_data},
-            )
-            self.safe_display(f"You sent file: {filename}", "self")
-        except Exception as e:
-            self.safe_display(f"[ERROR] {e}", "error")
+        file_size = os.path.getsize(filepath)
+        sha256 = calculate_sha256(filepath)
+
+        self.pending_send_path = filepath
+        send_framed(
+            self.sock,
+            {
+                "type": "file_offer",
+                "filename": filename,
+                "file_size": file_size,
+                "sha256": sha256
+            }
+        )
+        self.safe_display(f"Offered file '{filename}' ({round(file_size/(1024*1024), 2)} MB). Waiting for receiver approval...", "self")
+
+    def _stream_file_chunks(self, file_id: str):
+        filepath = getattr(self, "pending_send_path", None)
+        if not filepath or not os.path.exists(filepath):
+            return
+
+        chunk_idx = 0
+        with open(filepath, "rb") as f:
+            while chunk := f.read(CHUNK_SIZE):
+                b64_chunk = base64.b64encode(chunk).decode("utf-8")
+                send_framed(
+                    self.sock,
+                    {
+                        "type": "file_chunk",
+                        "file_id": file_id,
+                        "chunk_index": chunk_idx,
+                        "data_b64": b64_chunk
+                    }
+                )
+                chunk_idx += 1
+
+        send_framed(self.sock, {"type": "file_complete", "file_id": file_id})
+        self.safe_display(f"Finished uploading all chunks for {os.path.basename(filepath)}.", "self")
 
     def send_message(self, event=None):
         raw = self.entry.get().strip()
@@ -323,7 +324,7 @@ class ChatGUI:
             if raw.startswith("/msg "):
                 parts = raw.split(" ", 2)
                 if len(parts) < 3:
-                    self.safe_display("*** Usage: /msg <username> <message> ***", "system")
+                    self.safe_display("*** Usage: /msg   ***", "system")
                     return
                 send_framed(
                     self.sock,
@@ -332,7 +333,7 @@ class ChatGUI:
 
             elif raw == "/help":
                 self.safe_display(
-                    "Commands:\n  /msg <user> <text>  → private message\n  /quit             → leave chat",
+                    "Commands:\n  /msg    → private message\n  /quit             → leave chat",
                     "system",
                 )
 

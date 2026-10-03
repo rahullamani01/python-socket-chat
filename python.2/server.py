@@ -1,188 +1,304 @@
 # server.py
 import socket
 import threading
-import json
-import os
+import queue
 import uuid
 import logging
 from collections import deque
 
 from config import HOST, PORT, HISTORY_LIMIT
-from protocol import send_framed, recv_framed
+from protocol import encode_frame, recv_framed
 from utils import setup_logging, log_message
 
 setup_logging()
 
-# Global state tracking
-clients = {}                  # sock → username
+SEND_QUEUE_MAX = 512        # frames buffered per client before it is dropped as "too slow"
+IDLE_TIMEOUT = 60           # seconds without any frame (clients ping every 20s)
+FILE_BLOCK_TIMEOUT = 30     # backpressure wait when a receiver is slow during a file transfer
+MAX_TEXT = 4000
+
+clients = {}                # username -> Conn   (O(1) lookup, O(1) uniqueness check)
 clients_lock = threading.Lock()
 message_history = deque(maxlen=HISTORY_LIMIT)
-active_transfers = {}         # file_id → {"sender_sock": sock, "recipients": list}
+
+transfers = {}              # file_id -> transfer state
+transfers_lock = threading.Lock()
 
 
+class Conn:
+    """One client: socket + bounded outgoing queue + dedicated writer thread.
+    Broadcasting only enqueues bytes, so one slow client can never stall the others."""
+
+    def __init__(self, sock, addr):
+        self.sock = sock
+        self.addr = addr
+        self.name = None
+        self.alive = True
+        self.q = queue.Queue(maxsize=SEND_QUEUE_MAX)
+        threading.Thread(target=self._writer, daemon=True).start()
+
+    def send(self, frame: bytes, block: bool = False) -> bool:
+        if not self.alive:
+            return False
+        try:
+            if block:
+                self.q.put(frame, timeout=FILE_BLOCK_TIMEOUT)
+            else:
+                self.q.put_nowait(frame)
+            return True
+        except queue.Full:
+            logging.warning(f"[SLOW CLIENT] dropping {self.name or self.addr}")
+            self.close()
+            return False
+
+    def send_msg(self, msg: dict, binary: bytes = b"") -> bool:
+        return self.send(encode_frame(msg, binary))
+
+    def _writer(self):
+        while True:
+            frame = self.q.get()
+            if frame is None:
+                break
+            try:
+                self.sock.sendall(frame)
+            except OSError:
+                break
+        self.close()
+
+    def close(self):
+        if not self.alive:
+            return
+        self.alive = False
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        try:
+            self.q.put_nowait(None)
+        except queue.Full:
+            pass
+
+
+# ---------------------------------------------------------------- broadcasting
 def broadcast(msg: dict, exclude=None):
-    dead = []
+    frame = encode_frame(msg)  # encode ONCE, share the bytes with every client
     with clients_lock:
-        targets = list(clients.keys())
-
-    for sock in targets:
-        if sock is exclude:
-            continue
-        if not send_framed(sock, msg):
-            dead.append(sock)
-
-    for sock in dead:
-        remove_client(sock)
+        targets = list(clients.values())
+    for c in targets:
+        if c is not exclude:
+            c.send(frame)
 
 
 def broadcast_user_list():
     with clients_lock:
-        users = sorted(clients.values())
+        users = sorted(clients.keys())
     broadcast({"type": "users", "users": users})
 
 
-def remove_client(sock):
+# ---------------------------------------------------------------- file transfers
+def _start_or_cancel(fid, t):
+    """Call with transfers_lock held, once every recipient has answered."""
+    if t["accepted"]:
+        t["started"] = True
+        t["sender"].send_msg({"type": "file_go", "file_id": fid})
+    else:
+        transfers.pop(fid, None)
+        t["sender"].send_msg({"type": "file_declined", "file_id": fid})
+
+
+def _cleanup_transfers(conn):
+    with transfers_lock:
+        for fid, t in list(transfers.items()):
+            if t["sender"] is conn:
+                del transfers[fid]
+                for r in t["accepted"]:
+                    r.send_msg({"type": "file_abort", "file_id": fid})
+            elif conn in t["pending"] or conn in t["accepted"]:
+                t["pending"].discard(conn)
+                if conn in t["accepted"]:
+                    t["accepted"].remove(conn)
+                if not t["started"] and not t["pending"]:
+                    _start_or_cancel(fid, t)
+
+
+# ---------------------------------------------------------------- lifecycle
+def remove_client(conn):
     with clients_lock:
-        username = clients.pop(sock, None)
+        registered = conn.name is not None and clients.get(conn.name) is conn
+        if registered:
+            del clients[conn.name]
+    conn.close()
+    _cleanup_transfers(conn)
 
-    if username:
-        try:
-            sock.close()
-        except OSError:
-            pass
-
-        leave_msg = {"type": "system", "text": f"*** {username} has left the chat. ***"}
-        broadcast(leave_msg)
-        message_history.append(leave_msg)
+    if registered:
+        leave = {"type": "system", "text": f"*** {conn.name} has left the chat. ***"}
+        message_history.append(leave)
+        broadcast(leave)
         broadcast_user_list()
-        logging.info(f"[DISCONNECT] {username}")
+        logging.info(f"[DISCONNECT] {conn.name}")
 
 
-def handle_client(sock, addr):
+def handle_client(conn: Conn):
+    sock = conn.sock
     username = None
     try:
-        send_framed(sock, {"type": "nick_request"})
+        conn.send_msg({"type": "nick_request"})
         data = recv_framed(sock)
-
-        if not data or data.get("type") != "nick" or not data.get("username"):
+        if not data or data.get("type") != "nick":
             return
 
-        username = data["username"].strip()[:32]
+        username = str(data.get("username", "")).strip()[:32]
         if not username:
             return
 
         with clients_lock:
-            if username in clients.values():
-                send_framed(sock, {"type": "error", "text": "Username already taken."})
+            if username in clients:
+                conn.send_msg({"type": "error", "text": "Username already taken."})
                 return
-            clients[sock] = username
+            clients[username] = conn
+            conn.name = username
 
-        logging.info(f"[REGISTERED] {addr} → '{username}'")
+        logging.info(f"[REGISTERED] {conn.addr} -> '{username}'")
 
-        send_framed(sock, {"type": "welcome", "text": f"Welcome to the server, {username}!"})
+        conn.send_msg({"type": "welcome", "text": f"Welcome to the server, {username}!"})
         if message_history:
-            send_framed(sock, {"type": "history", "messages": list(message_history)})
+            conn.send_msg({"type": "history", "messages": list(message_history)})
 
-        join_msg = {"type": "system", "text": f"*** {username} joined the chat! ***"}
-        broadcast(join_msg, exclude=sock)
-        message_history.append(join_msg)
+        join = {"type": "system", "text": f"*** {username} joined the chat! ***"}
+        message_history.append(join)
+        broadcast(join, exclude=conn)
         broadcast_user_list()
 
         while True:
             data = recv_framed(sock)
             if data is None:
                 break
+            t = data.get("type")
 
-            msg_type = data.get("type")
+            if t == "ping":
+                continue
 
-            if msg_type == "chat":
-                text = data.get("text", "").strip()
+            elif t == "chat":
+                text = str(data.get("text", "")).strip()[:MAX_TEXT]
                 if text:
                     msg = {"type": "chat", "sender": username, "text": text}
-                    broadcast(msg, exclude=sock)
                     message_history.append(msg)
+                    broadcast(msg, exclude=conn)
                     log_message(username, "ALL", text, "broadcast")
 
-            elif msg_type == "pm":
-                target = data.get("target", "").strip()
-                text = data.get("text", "").strip()
-
+            elif t == "pm":
+                target = str(data.get("target", "")).strip()
+                text = str(data.get("text", "")).strip()[:MAX_TEXT]
                 if not target or not text:
-                    send_framed(sock, {"type": "error", "text": "Usage: /msg  "})
+                    conn.send_msg({"type": "error", "text": "Usage: /msg <user> <message>"})
                     continue
-
-                target_sock = None
                 with clients_lock:
-                    for s, name in clients.items():
-                        if name == target:
-                            target_sock = s
-                            break
-
-                if target_sock:
-                    send_framed(target_sock, {"type": "pm", "from": username, "text": text})
-                    send_framed(sock, {"type": "pm_self", "to": target, "text": text})
+                    target_conn = clients.get(target)
+                if target_conn:
+                    target_conn.send_msg({"type": "pm", "from": username, "text": text})
+                    conn.send_msg({"type": "pm_self", "to": target, "text": text})
                     log_message(username, target, text, "private")
                 else:
-                    send_framed(sock, {"type": "error", "text": f"User '{target}' not found."})
+                    conn.send_msg({"type": "error", "text": f"User '{target}' not found."})
 
-            # Binary Chunked Transfer Handlers
-            elif msg_type == "file_offer":
-                file_id = str(uuid.uuid4())
-                data["file_id"] = file_id
-                data["sender"] = username
-                active_transfers[file_id] = {"sender_sock": sock, "accepted_socks": []}
-                broadcast(data, exclude=sock)
+            # ---- file transfer ------------------------------------------------
+            elif t == "file_offer":
+                size = data.get("file_size")
+                if not isinstance(size, int) or size < 0:
+                    conn.send_msg({"type": "error", "text": "Invalid file offer."})
+                    continue
+                with clients_lock:
+                    recipients = [c for c in clients.values() if c is not conn]
+                if not recipients:
+                    conn.send_msg({"type": "error", "text": "No one else is online."})
+                    continue
 
-            elif msg_type == "file_response":
-                file_id = data.get("file_id")
-                accepted = data.get("accepted", False)
-                transfer = active_transfers.get(file_id)
+                fid = uuid.uuid4().hex
+                with transfers_lock:
+                    transfers[fid] = {
+                        "sender": conn,
+                        "pending": set(recipients),
+                        "accepted": [],
+                        "started": False,
+                    }
+                # ack goes first so the sender can map ref -> file_id before file_go arrives
+                conn.send_msg({"type": "file_offer_ack", "file_id": fid, "ref": data.get("ref")})
+                offer = encode_frame({
+                    "type": "file_offer",
+                    "file_id": fid,
+                    "sender": username,
+                    "filename": str(data.get("filename", "file"))[:255],
+                    "file_size": size,
+                    "sha256": str(data.get("sha256", "")),
+                })
+                for r in recipients:
+                    r.send(offer)
 
-                if transfer:
-                    if accepted:
-                        transfer["accepted_socks"].append(sock)
-                    # Tell sender to start streaming chunks
-                    send_framed(transfer["sender_sock"], data)
+            elif t == "file_response":
+                fid = data.get("file_id")
+                accepted = bool(data.get("accepted"))
+                with transfers_lock:
+                    tr = transfers.get(fid)
+                    if tr and not tr["started"] and conn in tr["pending"]:
+                        tr["pending"].discard(conn)
+                        if accepted:
+                            tr["accepted"].append(conn)
+                        if not tr["pending"]:
+                            _start_or_cancel(fid, tr)
 
-            elif msg_type == "file_chunk":
-                file_id = data.get("file_id")
-                transfer = active_transfers.get(file_id)
-                if transfer:
-                    # Forward chunk only to clients who accepted
-                    for recipient_sock in transfer["accepted_socks"]:
-                        send_framed(recipient_sock, data)
+            elif t == "file_chunk":
+                fid = data.get("file_id")
+                with transfers_lock:
+                    tr = transfers.get(fid)
+                    targets = list(tr["accepted"]) if tr and tr["sender"] is conn and tr["started"] else []
+                if targets:
+                    frame = encode_frame({"type": "file_chunk", "file_id": fid}, data.get("_bin", b""))
+                    for r in targets:
+                        r.send(frame, block=True)   # backpressure: slows the sender instead of dropping
 
-            elif msg_type == "file_complete":
-                file_id = data.get("file_id")
-                transfer = active_transfers.pop(file_id, None)
-                if transfer:
-                    for recipient_sock in transfer["accepted_socks"]:
-                        send_framed(recipient_sock, data)
-                    log_message(username, "ALL", f"[FILE TRANSFERRED: {file_id}]", "file")
+            elif t == "file_complete":
+                fid = data.get("file_id")
+                with transfers_lock:
+                    tr = transfers.get(fid)
+                    if tr and tr["sender"] is conn:
+                        del transfers[fid]
+                    else:
+                        tr = None
+                if tr:
+                    frame = encode_frame({"type": "file_complete", "file_id": fid})
+                    for r in tr["accepted"]:
+                        r.send(frame, block=True)
+                    log_message(username, "ALL", f"[FILE TRANSFERRED: {fid}]", "file")
 
-            elif msg_type == "quit":
+            elif t == "quit":
                 break
 
     except Exception as e:
-        logging.error(f"[ERROR] {username or addr}: {e}")
+        logging.error(f"[ERROR] {username or conn.addr}: {e}")
     finally:
-        remove_client(sock)
+        remove_client(conn)
 
 
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
-    server.listen()
+    server.listen(128)
     logging.info(f"[SERVER RUNNING] Listening on {HOST}:{PORT}")
 
     try:
         while True:
-            client_sock, addr = server.accept()
-            t = threading.Thread(target=handle_client, args=(client_sock, addr), daemon=True)
-            t.start()
+            sock, addr = server.accept()
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(IDLE_TIMEOUT)
+            conn = Conn(sock, addr)
+            threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
     except KeyboardInterrupt:
-        logging.info("\n[SERVER] Shutting down...")
+        logging.info("[SERVER] Shutting down...")
     finally:
         server.close()
 

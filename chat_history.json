@@ -1,0 +1,58 @@
+[
+    {
+        "timestamp": "2026-08-16 11:16:57",
+        "sender": "Alex",
+        "recipient": "ALL",
+        "type": "broadcast",
+        "content": "Hey Rahul, testing the new UI"
+    },
+    {
+        "timestamp": "2026-08-17 15:34:16",
+        "sender": "Alex",
+        "recipient": "ALL",
+        "type": "broadcast",
+        "content": "Hey Rahul, testing the new UI"
+    },
+    {
+        "timestamp": "2026-08-17 15:34:58",
+        "sender": "Rahul",
+        "recipient": "ALL",
+        "type": "broadcast",
+        "content": "search alex"
+    },
+    {
+        "timestamp": "2026-08-21 15:16:20",
+        "sender": "Alex",
+        "recipient": "ALL",
+        "type": "broadcast",
+        "content": "[ENCRYPTED PAYLOAD]"
+    },
+    {
+        "timestamp": "2026-08-21 15:16:26",
+        "sender": "Alex",
+        "recipient": "ALL",
+        "type": "broadcast",
+        "content": "[ENCRYPTED PAYLOAD]"
+    },
+    {
+        "timestamp": "2026-08-28 01:19:18",
+        "sender": "Alex",
+        "recipient": "ALL",
+        "type": "broadcast",
+        "content": "[ENCRYPTED PAYLOAD]"
+    },
+    {
+        "timestamp": "2026-08-28 01:19:31",
+        "sender": "Rahul",
+        "recipient": "ALL",
+        "type": "broadcast",
+        "content": "[ENCRYPTED PAYLOAD]"
+    },
+    {
+        "timestamp": "2026-08-28 01:20:08",
+        "sender": "Rahul",
+        "recipient": "ALL",
+        "type": "broadcast",
+        "content": "[ENCRYPTED PAYLOAD]"
+    }
+]

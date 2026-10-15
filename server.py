@@ -205,6 +205,20 @@ def handle_client(conn: Conn):
                 else:
                     conn.send_msg({"type": "error", "text": f"User '{target}' not found."})
 
+            # ---- Voice Notes (simple base64) ----
+            elif t == "voice":
+                filename = str(data.get("filename", "voice_note.wav"))[:255]
+                file_data = data.get("file_data")
+                if file_data:
+                    msg = {
+                        "type": "voice",
+                        "sender": username,
+                        "filename": filename,
+                        "file_data": file_data
+                    }
+                    broadcast(msg, exclude=conn)
+                    log_message(username, "ALL", f"[VOICE: {filename}]", "voice")
+
             # ---- file transfer ------------------------------------------------
             elif t == "file_offer":
                 size = data.get("file_size")

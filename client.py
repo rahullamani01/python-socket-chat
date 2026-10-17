@@ -1,9 +1,14 @@
 import socket
 import threading
 import json
+import struct
+import time
 import sys
 import os
 import base64
+import hashlib
+import uuid
+import zlib
 import tempfile
 import wave
 import tkinter as tk
@@ -15,9 +20,14 @@ import numpy as np
 # ==================== CONFIG ====================
 HOST = "127.0.0.1"
 PORT = 65433
-HEADER_SIZE = 4
-MAX_MESSAGE_SIZE = 10 * 1024 * 1024
-MAX_FILE_SIZE = 5 * 1024 * 1024
+HEADER_SIZE = 8  # json length (4 bytes) + binary length (4 bytes)
+MAX_MESSAGE_SIZE = 1 * 1024 * 1024  # Must match protocol.MAX_JSON
+MAX_BINARY_SIZE = 4 * 1024 * 1024   # Must match protocol.MAX_BINARY
+MAX_FILE_SIZE = 700 * 1024          # Voice notes still travel as Base64 inside JSON
+MAX_TRANSFER_SIZE = 50 * 1024 * 1024  # Real file transfers are streamed in chunks
+CHUNK_SIZE = 64 * 1024
+DOWNLOAD_DIR = "downloads"
+APP_TITLE = "Python Socket Chat"
 SAMPLE_RATE = 44100
 CHANNELS = 1
 
@@ -57,41 +67,70 @@ THEMES = {
     }
 }
 
+# Per-user name colors (same user -> same color on every client, in both themes)
+USER_COLORS = {
+    "dark": ["#f38ba8", "#fab387", "#f9e2af", "#a6e3a1", "#94e2d5",
+             "#89dceb", "#74c7ec", "#b4befe", "#cba6f7", "#f5c2e7"],
+    "light": ["#c62828", "#d84315", "#9e7500", "#2e7d32", "#00796b",
+              "#0277bd", "#1565c0", "#4527a0", "#7b1fa2", "#ad1457"],
+}
+
+
+def user_color_index(name: str) -> int:
+    # crc32 is stable across runs/machines (Python's hash() is randomized per process)
+    return zlib.crc32(str(name).encode("utf-8")) % len(USER_COLORS["dark"])
+
+
 # ==================== PROTOCOL ====================
-def send_framed(sock, data: dict) -> bool:
+_send_lock = threading.Lock()  # several threads send (UI, heartbeat, file streaming)
+
+
+def send_framed(sock, data: dict, binary: bytes = b"") -> bool:
+    """Send one frame: [json_len:4][bin_len:4][json][binary] (matches protocol.py)."""
     try:
-        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        if len(payload) > MAX_MESSAGE_SIZE:
+        payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if not payload or len(payload) > MAX_MESSAGE_SIZE or len(binary) > MAX_BINARY_SIZE:
             return False
-        header = len(payload).to_bytes(HEADER_SIZE, "big")
-        sock.sendall(header + payload)
+        frame = struct.pack(">II", len(payload), len(binary)) + payload + binary
+        with _send_lock:
+            sock.sendall(frame)
         return True
-    except (BrokenPipeError, ConnectionResetError, OSError):
+    except (BrokenPipeError, ConnectionResetError, OSError, TypeError, ValueError):
         return False
 
 
-def recv_framed(sock):
-    try:
-        header = b""
-        while len(header) < HEADER_SIZE:
-            chunk = sock.recv(HEADER_SIZE - len(header))
-            if not chunk:
-                return None
-            header += chunk
-
-        length = int.from_bytes(header, "big")
-        if length <= 0 or length > MAX_MESSAGE_SIZE:
+def _recv_exact(sock, size: int):
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = sock.recv(size - len(chunks))
+        if not chunk:
             return None
+        chunks.extend(chunk)
+    return chunks
 
-        data = b""
-        while len(data) < length:
-            chunk = sock.recv(min(4096, length - len(data)))
-            if not chunk:
+
+def recv_framed(sock):
+    """Receive one JSON + optional binary frame using the server's protocol."""
+    try:
+        header = _recv_exact(sock, HEADER_SIZE)
+        if header is None:
+            return None
+        json_len, bin_len = struct.unpack(">II", header)
+        if json_len == 0 or json_len > MAX_MESSAGE_SIZE or bin_len > MAX_BINARY_SIZE:
+            return None
+        payload = _recv_exact(sock, json_len)
+        if payload is None:
+            return None
+        message = json.loads(payload.decode("utf-8"))
+        if not isinstance(message, dict):
+            return None
+        if bin_len:
+            binary = _recv_exact(sock, bin_len)
+            if binary is None:
                 return None
-            data += chunk
-
-        return json.loads(data.decode("utf-8"))
-    except (ConnectionResetError, json.JSONDecodeError, OSError, ValueError):
+            message["_bin"] = binary
+        return message
+    except (ConnectionResetError, json.JSONDecodeError, OSError, ValueError, struct.error):
         return None
 
 
@@ -110,7 +149,7 @@ def play_alert():
 def file_to_base64(file_path: str) -> str:
     size = os.path.getsize(file_path)
     if size > MAX_FILE_SIZE:
-        raise ValueError(f"File too large (max {MAX_FILE_SIZE // 1024 // 1024} MB)")
+        raise ValueError(f"File too large (max {MAX_FILE_SIZE // 1024} KB)")
     with open(file_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
@@ -121,12 +160,40 @@ def base64_to_file(base64_str: str, output_path: str):
         f.write(file_bytes)
 
 
+def sha256_of_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(CHUNK_SIZE):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fmt_size(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{n} B"
+
+
+def unique_path(directory: str, filename: str) -> str:
+    safe = os.path.basename(str(filename)).strip() or "file"
+    base, ext = os.path.splitext(safe)
+    candidate = os.path.join(directory, safe)
+    n = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{base}_{n}{ext}")
+        n += 1
+    return candidate
+
+
 def show_notification(title: str, message: str):
     try:
         notification.notify(
             title=title,
             message=message,
-            app_name="Python Socket Chat",
+            app_name=APP_TITLE,
             timeout=4
         )
     except Exception:
@@ -137,7 +204,7 @@ def show_notification(title: str, message: str):
 class ChatGUI:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Python Socket Chat")
+        self.root.title(APP_TITLE)
         self.root.geometry("820x620")
         self.root.minsize(650, 480)
 
@@ -155,17 +222,24 @@ class ChatGUI:
         self.sock = None
         self.running = False
         self.window_focused = True
+        self.unread = 0
+        self.users = []
 
         # Voice recording state
         self.is_recording = False
         self.recording_data = []
         self.stream = None
 
+        # File transfer state
+        self.pending_offers = {}   # ref -> {path, filename, size}   (waiting for server ack)
+        self.outgoing = {}         # file_id -> {path, filename, size} (waiting for file_go)
+        self.incoming = {}         # file_id -> receiving state
+
         self._build_ui()
         self._apply_theme()
         self._connect()
 
-        self.root.bind("<FocusIn>", lambda e: setattr(self, "window_focused", True))
+        self.root.bind("<FocusIn>", self._on_focus_in)
         self.root.bind("<FocusOut>", lambda e: setattr(self, "window_focused", False))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.mainloop()
@@ -308,6 +382,11 @@ class ChatGUI:
         self.chat.tag_config("voice", foreground=t["voice"])
         self.chat.tag_config("history", foreground=t["history"])
 
+        # Colored usernames (recolored when the theme changes)
+        for i, color in enumerate(USER_COLORS[self.current_theme]):
+            self.chat.tag_config(f"user_{i}", foreground=color, font=("Segoe UI", 11, "bold"))
+        self._update_users(self.users)
+
         if self.current_theme == "dark":
             self.theme_btn.config(text="☀️ Light Mode")
         else:
@@ -324,9 +403,29 @@ class ChatGUI:
             self.sock.connect((HOST, PORT))
             self.running = True
             threading.Thread(target=self.receive_loop, daemon=True).start()
+            threading.Thread(target=self.heartbeat_loop, daemon=True).start()
         except Exception as e:
             messagebox.showerror("Connection Error", str(e))
             self.root.destroy()
+
+    # ---------- Focus / unread counter ----------
+    def _on_focus_in(self, event=None):
+        self.window_focused = True
+        if self.unread:
+            self.unread = 0
+            self._update_title()
+
+    def _update_title(self):
+        self.root.title(f"({self.unread}) {APP_TITLE}" if self.unread else APP_TITLE)
+
+    def _bump_unread(self):
+        """Runs on the UI thread. Only counts while the window is not focused."""
+        if not self.window_focused:
+            self.unread += 1
+            self._update_title()
+
+    def bump_unread(self):
+        self.root.after(0, self._bump_unread)
 
     # ---------- Voice Recording ----------
     def toggle_recording(self):
@@ -420,16 +519,39 @@ class ChatGUI:
         self.chat.yview(tk.END)
         self.chat.config(state="disabled")
 
+    def safe_display_chat(self, sender, text, body_tag="normal", color_name=None):
+        self.root.after(0, lambda: self._display_chat(sender, text, body_tag, color_name))
+
+    def _display_chat(self, sender, text, body_tag="normal", color_name=None):
+        """Colored username followed by the message body."""
+        name_tag = f"user_{user_color_index(color_name or sender)}"
+        self.chat.config(state="normal")
+        self.chat.insert(tk.END, str(sender), name_tag)
+        self.chat.insert(tk.END, f": {text}\n", body_tag)
+        self.chat.yview(tk.END)
+        self.chat.config(state="disabled")
+
     def safe_update_users(self, users: list):
         self.root.after(0, lambda: self._update_users(users))
 
     def _update_users(self, users: list):
+        self.users = list(users)
+        palette = USER_COLORS[self.current_theme]
         self.user_list.delete(0, tk.END)
-        for u in users:
+        for i, u in enumerate(self.users):
             label = f"● {u} (You)" if u == self.username else f"● {u}"
             self.user_list.insert(tk.END, label)
+            self.user_list.itemconfig(i, fg=palette[user_color_index(u)])
 
     # ---------- Networking ----------
+    def heartbeat_loop(self):
+        """Keep idle connections alive; the server's idle timeout is 60 seconds."""
+        while self.running:
+            time.sleep(20)
+            if self.running and self.sock:
+                if not send_framed(self.sock, {"type": "ping"}):
+                    break
+
     def receive_loop(self):
         while self.running:
             try:
@@ -439,6 +561,9 @@ class ChatGUI:
                 self.handle_message(data)
             except Exception:
                 break
+
+        for fid in list(self.incoming):
+            self._abort_incoming(fid)
 
         if self.running:
             self.safe_display("*** Disconnected from server ***", "error")
@@ -463,46 +588,91 @@ class ChatGUI:
         elif t == "chat":
             sender = data['sender']
             text = data['text']
-            self.safe_display(f"{sender}: {text}", "normal")
+            self.safe_display_chat(sender, text, "normal")
             play_alert()
-            if not self.window_focused and sender != self.username:
-                show_notification(f"Message from {sender}", text)
+            if sender != self.username:
+                self.bump_unread()
+                if not self.window_focused:
+                    show_notification(f"Message from {sender}", text)
 
         elif t == "pm":
             sender = data['from']
             text = data['text']
             self.safe_display(f"[PM from {sender}]: {text}", "pm")
             play_alert()
+            self.bump_unread()
             if not self.window_focused:
                 show_notification(f"Private message from {sender}", text)
 
         elif t == "pm_self":
             self.safe_display(f"[PM to {data['to']}]: {data['text']}", "pm")
 
-        elif t == "file":
-            sender = data.get("sender", "Unknown")
-            filename = data.get("filename", "file")
-            save_dir = "downloads"
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, f"received_{filename}")
-            try:
-                base64_to_file(data["file_data"], save_path)
-                self.safe_display(f"📁 [{sender}] sent file: {filename} → downloads/", "file")
-                play_alert()
-                if not self.window_focused:
-                    show_notification(f"File from {sender}", filename)
-            except Exception as e:
-                self.safe_display(f"[ERROR] Failed to save file: {e}", "error")
+        # ---------- file transfer: sender side ----------
+        elif t == "file_offer_ack":
+            offer = self.pending_offers.pop(data.get("ref"), None)
+            if offer and data.get("file_id"):
+                self.outgoing[data["file_id"]] = offer
+
+        elif t == "file_go":
+            offer = self.outgoing.pop(data.get("file_id"), None)
+            if offer:
+                self.safe_display(f"📁 Sending '{offer['filename']}'...", "file")
+                threading.Thread(
+                    target=self._stream_file,
+                    args=(data["file_id"], offer),
+                    daemon=True,
+                ).start()
+
+        elif t == "file_declined":
+            offer = self.outgoing.pop(data.get("file_id"), None)
+            name = offer["filename"] if offer else "file"
+            self.safe_display(f"📁 Nobody accepted '{name}'.", "error")
+
+        # ---------- file transfer: receiver side ----------
+        elif t == "file_offer":
+            play_alert()
+            self.bump_unread()
+            if not self.window_focused:
+                show_notification(
+                    f"File from {data.get('sender', 'Unknown')}",
+                    str(data.get("filename", "file")),
+                )
+            self.root.after(0, lambda d=data: self._prompt_offer(d))
+
+        elif t == "file_chunk":
+            fid = data.get("file_id")
+            st = self.incoming.get(fid)
+            if st:
+                blob = data.get("_bin", b"")
+                try:
+                    st["fh"].write(blob)
+                    st["hasher"].update(blob)
+                    st["received"] += len(blob)
+                except OSError as e:
+                    self._abort_incoming(fid, f"[ERROR] Could not write file: {e}")
+                    return
+                if st["received"] > st["size"]:
+                    self._abort_incoming(fid, f"[ERROR] '{st['filename']}' was bigger than announced.")
+
+        elif t == "file_complete":
+            self._finish_incoming(data.get("file_id"))
+
+        elif t == "file_abort":
+            fid = data.get("file_id")
+            st = self.incoming.get(fid)
+            name = st["filename"] if st else "file"
+            self._abort_incoming(fid, f"📁 Transfer of '{name}' was cancelled by the sender.")
 
         elif t == "voice":
             sender = data.get("sender", "Unknown")
-            save_dir = "downloads"
+            save_dir = DOWNLOAD_DIR
             os.makedirs(save_dir, exist_ok=True)
             save_path = os.path.join(save_dir, f"voice_{sender}_{os.getpid()}.wav")
             try:
                 base64_to_file(data["file_data"], save_path)
                 self.safe_display(f"🎤 [{sender}] sent a voice note (playing...)", "voice")
                 play_alert()
+                self.bump_unread()
                 # Play in background
                 threading.Thread(target=self.play_voice_note, args=(save_path,), daemon=True).start()
 
@@ -517,27 +687,161 @@ class ChatGUI:
     def _render_history_item(self, msg: dict):
         t = msg.get("type")
         if t == "chat":
-            self.safe_display(f"{msg.get('sender')}: {msg.get('text')}", "history")
+            self.safe_display_chat(msg.get("sender"), msg.get("text"), "history")
         elif t == "system":
             self.safe_display(msg.get("text", ""), "history")
 
+    # ---------- File transfer helpers ----------
     def send_file_dialog(self):
+        if not self.running:
+            return
         filepath = filedialog.askopenfilename(title="Select File to Send")
         if not filepath:
             return
+        try:
+            size = os.path.getsize(filepath)
+        except OSError as e:
+            self.safe_display(f"[ERROR] {e}", "error")
+            return
+        if size == 0:
+            self.safe_display("[ERROR] Cannot send an empty file.", "error")
+            return
+        if size > MAX_TRANSFER_SIZE:
+            self.safe_display(
+                f"[ERROR] File too large (max {fmt_size(MAX_TRANSFER_SIZE)}).", "error"
+            )
+            return
+        # hashing a big file can take a moment, so keep it off the UI thread
+        threading.Thread(target=self._offer_file, args=(filepath, size), daemon=True).start()
 
+    def _offer_file(self, filepath: str, size: int):
         filename = os.path.basename(filepath)
         try:
-            b64_data = file_to_base64(filepath)
-            send_framed(self.sock, {
-                "type": "file",
-                "filename": filename,
-                "file_data": b64_data
-            })
-            self.safe_display(f"You sent file: {filename}", "self")
-        except Exception as e:
-            self.safe_display(f"[ERROR] {e}", "error")
+            digest = sha256_of_file(filepath)
+        except OSError as e:
+            self.safe_display(f"[ERROR] Could not read file: {e}", "error")
+            return
 
+        ref = uuid.uuid4().hex
+        self.pending_offers[ref] = {"path": filepath, "filename": filename, "size": size}
+        ok = send_framed(self.sock, {
+            "type": "file_offer",
+            "ref": ref,
+            "filename": filename,
+            "file_size": size,
+            "sha256": digest,
+        })
+        if ok:
+            self.safe_display(
+                f"📁 Offered '{filename}' ({fmt_size(size)}) — waiting for others to accept...",
+                "file",
+            )
+        else:
+            self.pending_offers.pop(ref, None)
+            self.safe_display("[ERROR] Failed to send file offer.", "error")
+
+    def _stream_file(self, fid: str, offer: dict):
+        name = offer["filename"]
+        try:
+            with open(offer["path"], "rb") as f:
+                while chunk := f.read(CHUNK_SIZE):
+                    if not self.running or not send_framed(
+                        self.sock, {"type": "file_chunk", "file_id": fid}, chunk
+                    ):
+                        raise ConnectionError("connection lost")
+            if not send_framed(self.sock, {"type": "file_complete", "file_id": fid}):
+                raise ConnectionError("connection lost")
+            self.safe_display(f"📁 Sent '{name}' ✓", "file")
+        except Exception as e:
+            self.safe_display(f"[ERROR] Sending '{name}' failed: {e}", "error")
+
+    def _prompt_offer(self, data: dict):
+        """Runs on the UI thread: ask the user, then answer the server."""
+        fid = data.get("file_id")
+        sender = data.get("sender", "Unknown")
+        filename = os.path.basename(str(data.get("filename", "file"))) or "file"
+        try:
+            size = int(data.get("file_size", 0))
+        except (TypeError, ValueError):
+            size = 0
+
+        accept = messagebox.askyesno(
+            "Incoming file",
+            f"{sender} wants to send you:\n\n{filename} ({fmt_size(size)})\n\nAccept?",
+            parent=self.root,
+        )
+
+        if accept:
+            try:
+                os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+                path = unique_path(DOWNLOAD_DIR, filename)
+                fh = open(path, "wb")
+            except OSError as e:
+                self._display(f"[ERROR] Cannot save file: {e}", "error")
+                accept = False
+            else:
+                # state must exist BEFORE we answer, chunks can arrive right after
+                self.incoming[fid] = {
+                    "fh": fh,
+                    "path": path,
+                    "filename": filename,
+                    "sender": sender,
+                    "size": size,
+                    "sha256": str(data.get("sha256", "")),
+                    "hasher": hashlib.sha256(),
+                    "received": 0,
+                }
+                self._display(f"📁 Receiving '{filename}' from {sender}...", "file")
+
+        if not accept:
+            self._display(f"📁 You declined '{filename}' from {sender}.", "system")
+        send_framed(self.sock, {"type": "file_response", "file_id": fid, "accepted": accept})
+
+    def _finish_incoming(self, fid):
+        st = self.incoming.pop(fid, None)
+        if not st:
+            return
+        try:
+            st["fh"].close()
+        except OSError:
+            pass
+
+        hash_ok = (not st["sha256"]) or st["hasher"].hexdigest() == st["sha256"]
+        if hash_ok and st["received"] == st["size"]:
+            self.safe_display(
+                f"📁 Received '{st['filename']}' from {st['sender']} → {st['path']} ✓",
+                "file",
+            )
+            play_alert()
+            self.bump_unread()
+            if not self.window_focused:
+                show_notification(f"File from {st['sender']}", st["filename"])
+        else:
+            try:
+                os.remove(st["path"])
+            except OSError:
+                pass
+            self.safe_display(
+                f"[ERROR] '{st['filename']}' arrived corrupted (checksum mismatch) and was deleted.",
+                "error",
+            )
+
+    def _abort_incoming(self, fid, message=None):
+        st = self.incoming.pop(fid, None)
+        if not st:
+            return
+        try:
+            st["fh"].close()
+        except OSError:
+            pass
+        try:
+            os.remove(st["path"])
+        except OSError:
+            pass
+        if message:
+            self.safe_display(message, "error")
+
+    # ---------- Sending messages ----------
     def send_message(self, event=None):
         raw = self.entry.get().strip()
         if not raw or not self.running:
@@ -562,6 +866,7 @@ class ChatGUI:
                     "Commands:\n"
                     "  /msg <user> <text>  → private message\n"
                     "  /quit               → leave chat\n"
+                    "  📁 button           → send a file (others must accept)\n"
                     "  🎤 button           → record voice note",
                     "system",
                 )
@@ -571,7 +876,7 @@ class ChatGUI:
 
             else:
                 send_framed(self.sock, {"type": "chat", "text": raw})
-                self.safe_display(f"You: {raw}", "self")
+                self.safe_display_chat("You", raw, "self", color_name=self.username)
 
         except Exception:
             self.safe_display("[ERROR] Failed to send message.", "error")
@@ -580,6 +885,8 @@ class ChatGUI:
         self.running = False
         if self.is_recording:
             self.stop_recording()
+        for fid in list(self.incoming):
+            self._abort_incoming(fid)
         try:
             if self.sock:
                 send_framed(self.sock, {"type": "quit"})

@@ -1,4 +1,6 @@
 # server.py
+import os
+import json
 import socket
 import threading
 import queue
@@ -16,13 +18,58 @@ SEND_QUEUE_MAX = 512        # frames buffered per client before it is dropped as
 IDLE_TIMEOUT = 60           # seconds without any frame (clients ping every 20s)
 FILE_BLOCK_TIMEOUT = 30     # backpressure wait when a receiver is slow during a file transfer
 MAX_TEXT = 4000
+ROOM_HISTORY_FILE = "logs/room_history.jsonl"   # persistent room history
 
 clients = {}                # username -> Conn   (O(1) lookup, O(1) uniqueness check)
 clients_lock = threading.Lock()
 message_history = deque(maxlen=HISTORY_LIMIT)
+history_lock = threading.Lock()
 
 transfers = {}              # file_id -> transfer state
 transfers_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------- persistent history
+def load_history():
+    """Load the last HISTORY_LIMIT messages from disk, then compact the file."""
+    if not os.path.exists(ROOM_HISTORY_FILE):
+        return
+    try:
+        with open(ROOM_HISTORY_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # skip corrupted line
+                if isinstance(msg, dict):
+                    message_history.append(msg)
+        # rewrite file with only the kept messages so it never grows forever
+        with open(ROOM_HISTORY_FILE, "w", encoding="utf-8") as f:
+            for msg in message_history:
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        logging.info(f"[HISTORY] Loaded {len(message_history)} messages from disk")
+    except OSError as e:
+        logging.error(f"[HISTORY] Failed to load: {e}")
+
+
+def add_history(msg: dict):
+    """Add a message to memory history and append it to the history file."""
+    with history_lock:
+        message_history.append(msg)
+        try:
+            os.makedirs(os.path.dirname(ROOM_HISTORY_FILE), exist_ok=True)
+            with open(ROOM_HISTORY_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        except OSError as e:
+            logging.error(f"[HISTORY] Failed to save: {e}")
+
+
+def get_history_snapshot():
+    with history_lock:
+        return list(message_history)
 
 
 class Conn:
@@ -136,7 +183,7 @@ def remove_client(conn):
 
     if registered:
         leave = {"type": "system", "text": f"*** {conn.name} has left the chat. ***"}
-        message_history.append(leave)
+        add_history(leave)
         broadcast(leave)
         broadcast_user_list()
         logging.info(f"[DISCONNECT] {conn.name}")
@@ -165,11 +212,12 @@ def handle_client(conn: Conn):
         logging.info(f"[REGISTERED] {conn.addr} -> '{username}'")
 
         conn.send_msg({"type": "welcome", "text": f"Welcome to the server, {username}!"})
-        if message_history:
-            conn.send_msg({"type": "history", "messages": list(message_history)})
+        history = get_history_snapshot()
+        if history:
+            conn.send_msg({"type": "history", "messages": history})
 
         join = {"type": "system", "text": f"*** {username} joined the chat! ***"}
-        message_history.append(join)
+        add_history(join)
         broadcast(join, exclude=conn)
         broadcast_user_list()
 
@@ -186,7 +234,7 @@ def handle_client(conn: Conn):
                 text = str(data.get("text", "")).strip()[:MAX_TEXT]
                 if text:
                     msg = {"type": "chat", "sender": username, "text": text}
-                    message_history.append(msg)
+                    add_history(msg)
                     broadcast(msg, exclude=conn)
                     log_message(username, "ALL", text, "broadcast")
 
@@ -298,6 +346,8 @@ def handle_client(conn: Conn):
 
 
 def main():
+    load_history()   # restore chat history from previous runs
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))

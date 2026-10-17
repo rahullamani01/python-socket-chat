@@ -10,4 +10,5 @@ downloads/
 .idea/
 venv/
 .venv/
-env/
+env/logs/
+downloads/

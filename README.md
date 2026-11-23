@@ -138,7 +138,8 @@ Python 3.10–3.13. See [architecture](docs/ARCHITECTURE.md) and
 
 - Voice notes are sent as Base64 inside JSON, so they are limited to about 700 KB (roughly 8 seconds).
 - Private messages, voice notes and files are **not** stored in the replayed chat history.
-- No encryption or authentication yet: usernames are first-come, first-served.
+- Optional TLS is available, but disabled by default; usernames are still
+  unauthenticated. See [security and TLS setup](docs/SECURITY.md).
 - Runtime logs and downloads are ignored by Git; older tracked artifacts remain in the repository.
 
 ---

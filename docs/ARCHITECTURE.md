@@ -36,9 +36,10 @@ relative to the working directory. Back up data before experimenting.
 
 ## Known limitations and next steps
 
-- No accounts, authentication, TLS, or protection from malicious peers.
-- The server accepts untrusted file metadata without a server-side transfer
-  size limit; clients should only be used on trusted networks.
+- Optional TLS is available; it is off by default. Account storage is not yet
+  connected to chat, and usernames are unauthenticated.
+- The server caps announced file sizes, but does not enforce the announced
+  size on streamed chunks. Clients should only be used on trusted networks.
 - Client and server duplicate protocol and connection configuration.
 - Tests do not yet cover GUI behavior, reconnects, concurrent load, failure
   paths for all transfers, or process-level restart behavior.

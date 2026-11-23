@@ -12,3 +12,6 @@ venv/
 .venv/
 env/logs/
 downloads/
+*.sqlite3
+*.sqlite3-*
+*.key

@@ -12,8 +12,6 @@ from config import HOST, PORT, HISTORY_LIMIT
 from protocol import encode_frame, recv_framed
 from utils import setup_logging, log_message
 
-setup_logging()
-
 SEND_QUEUE_MAX = 512        # frames buffered per client before it is dropped as "too slow"
 IDLE_TIMEOUT = 60           # seconds without any frame (clients ping every 20s)
 FILE_BLOCK_TIMEOUT = 30     # backpressure wait when a receiver is slow during a file transfer
@@ -346,6 +344,7 @@ def handle_client(conn: Conn):
 
 
 def main():
+    setup_logging()
     load_history()   # restore chat history from previous runs
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

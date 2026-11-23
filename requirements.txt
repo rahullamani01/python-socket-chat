@@ -1,0 +1,4 @@
+# Client dependencies; the server and automated tests use the standard library.
+numpy
+plyer
+sounddevice

@@ -79,7 +79,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # 2. install client dependencies
-pip install plyer sounddevice numpy
+python -m pip install -r requirements.txt
 
 # 3. start the server
 python server.py
@@ -88,7 +88,21 @@ python server.py
 python client.py
 ```
 
-By default everything runs on `127.0.0.1:65433`. To chat across a network, change `HOST` in `config.py` (server) and `HOST` in `client.py` to the server's IP address.
+By default everything runs on `127.0.0.1:65433`. To chat across a trusted network, configure the server bind address in `config.py` and the server's reachable address in `client.py`. The server is unauthenticated and unencrypted; do not expose it to the public internet.
+
+## 🧪 Tests
+
+Run the root application's standard-library tests from the repository root:
+
+```bash
+python -m unittest discover -v
+```
+
+These cover protocol framing and selected server interactions, including messaging,
+history and file forwarding. They do not currently test the Tkinter GUI or real
+microphone and notification integrations. GitHub Actions runs these tests on
+Python 3.10–3.13. See [architecture](docs/ARCHITECTURE.md) and
+[contributing](CONTRIBUTING.md) for details.
 
 ---
 
@@ -114,7 +128,7 @@ By default everything runs on `127.0.0.1:65433`. To chat across a network, chang
 ├── config.py      # Host, port, history limit, log path
 ├── models.py      # Message dataclasses
 ├── utils.py       # Logging and SHA-256 helpers
-├── tests/         # Protocol tests
+├── tests/         # Protocol and server tests
 └── logs/          # Generated at runtime (server.log, chat history)
 ```
 
@@ -125,7 +139,7 @@ By default everything runs on `127.0.0.1:65433`. To chat across a network, chang
 - Voice notes are sent as Base64 inside JSON, so they are limited to about 700 KB (roughly 8 seconds).
 - Private messages, voice notes and files are **not** stored in the replayed chat history.
 - No encryption or authentication yet: usernames are first-come, first-served.
-- Add `logs/` and `downloads/` to `.gitignore` so runtime files are not committed.
+- Runtime logs and downloads are ignored by Git; older tracked artifacts remain in the repository.
 
 ---
 

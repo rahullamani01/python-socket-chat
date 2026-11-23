@@ -6,16 +6,19 @@ import threading
 import queue
 import uuid
 import logging
+import ssl
 from collections import deque
 
 from config import HOST, PORT, HISTORY_LIMIT
 from protocol import encode_frame, recv_framed
 from utils import setup_logging, log_message
+from transport import server_context
 
 SEND_QUEUE_MAX = 512        # frames buffered per client before it is dropped as "too slow"
 IDLE_TIMEOUT = 60           # seconds without any frame (clients ping every 20s)
 FILE_BLOCK_TIMEOUT = 30     # backpressure wait when a receiver is slow during a file transfer
 MAX_TEXT = 4000
+MAX_TRANSFER_SIZE = 50 * 1024 * 1024
 ROOM_HISTORY_FILE = "logs/room_history.jsonl"   # persistent room history
 
 clients = {}                # username -> Conn   (O(1) lookup, O(1) uniqueness check)
@@ -268,7 +271,7 @@ def handle_client(conn: Conn):
             # ---- file transfer ------------------------------------------------
             elif t == "file_offer":
                 size = data.get("file_size")
-                if not isinstance(size, int) or size < 0:
+                if type(size) is not int or not 0 <= size <= MAX_TRANSFER_SIZE:
                     conn.send_msg({"type": "error", "text": "Invalid file offer."})
                     continue
                 with clients_lock:
@@ -343,8 +346,27 @@ def handle_client(conn: Conn):
         remove_client(conn)
 
 
+def accept_client(sock, addr, tls_context):
+    """Perform any TLS handshake outside the accept loop."""
+    try:
+        if tls_context:
+            sock = tls_context.wrap_socket(sock, server_side=True)
+        conn = Conn(sock, addr)
+        handle_client(conn)
+    except (OSError, ssl.SSLError) as e:
+        logging.warning("[CONNECTION] %s: %s", addr, e)
+        sock.close()
+
+
 def main():
     setup_logging()
+    cert = os.environ.get("CHAT_TLS_CERT")
+    key = os.environ.get("CHAT_TLS_KEY")
+    if bool(cert) != bool(key):
+        raise ValueError("Set both CHAT_TLS_CERT and CHAT_TLS_KEY, or neither.")
+    tls_context = server_context(cert, key) if cert else None
+    if not tls_context:
+        logging.warning("TLS is disabled; use only on trusted networks.")
     load_history()   # restore chat history from previous runs
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -358,8 +380,7 @@ def main():
             sock, addr = server.accept()
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.settimeout(IDLE_TIMEOUT)
-            conn = Conn(sock, addr)
-            threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+            threading.Thread(target=accept_client, args=(sock, addr, tls_context), daemon=True).start()
     except KeyboardInterrupt:
         logging.info("[SERVER] Shutting down...")
     finally:

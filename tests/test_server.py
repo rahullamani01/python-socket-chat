@@ -97,3 +97,10 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(bytes(self.receive_type(bob, "file_chunk")["_bin"]), b"abc")
         send_framed(alice, {"type": "file_complete", "file_id": fid})
         self.assertEqual(self.receive_type(bob, "file_complete")["file_id"], fid)
+
+    def test_rejects_invalid_file_sizes(self):
+        alice = self.connect("Alice")
+        for size in (-1, True, server.MAX_TRANSFER_SIZE + 1, "3"):
+            with self.subTest(size=size):
+                send_framed(alice, {"type": "file_offer", "file_size": size})
+                self.assertEqual(self.receive_type(alice, "error")["text"], "Invalid file offer.")

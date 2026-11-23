@@ -16,6 +16,7 @@ from tkinter import messagebox, simpledialog, scrolledtext, filedialog
 from plyer import notification
 import sounddevice as sd
 import numpy as np
+from transport import client_context
 
 # ==================== CONFIG ====================
 HOST = "127.0.0.1"
@@ -400,7 +401,14 @@ class ChatGUI:
     def _connect(self):
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(10)
             self.sock.connect((HOST, PORT))
+            if os.environ.get("CHAT_TLS") == "1":
+                context = client_context(os.environ.get("CHAT_TLS_CA"))
+                self.sock = context.wrap_socket(
+                    self.sock, server_hostname=os.environ.get("CHAT_TLS_SERVER_NAME", HOST)
+                )
+            self.sock.settimeout(None)
             self.running = True
             threading.Thread(target=self.receive_loop, daemon=True).start()
             threading.Thread(target=self.heartbeat_loop, daemon=True).start()
